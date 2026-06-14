@@ -37,12 +37,14 @@ export function extractMessage(message: WAMessageContent | undefined | null): Ex
     content.extendedTextMessage?.text ??
     content.imageMessage?.caption ??
     content.videoMessage?.caption ??
+    content.documentMessage?.caption ??
     "";
 
   const contextInfo =
     content.extendedTextMessage?.contextInfo ??
     content.imageMessage?.contextInfo ??
     content.videoMessage?.contextInfo ??
+    content.documentMessage?.contextInfo ??
     undefined;
 
   return { text, contextInfo, contentType: getMessageContentType(content) };

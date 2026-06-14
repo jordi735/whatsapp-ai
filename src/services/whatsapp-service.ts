@@ -8,6 +8,7 @@ import P from "pino";
 import QRCode from "qrcode";
 
 import type { AppConfig } from "../config.js";
+import { KeyedAsyncQueue } from "../utils/async-queue.js";
 import { getDisconnectStatusCode } from "../utils/errors.js";
 import { createLogger, type AppLogger } from "../utils/logger.js";
 import { previewText } from "../utils/text.js";
@@ -33,6 +34,7 @@ export async function startWhatsAppService({
   ollamaService,
 }: StartWhatsAppServiceOptions): Promise<void> {
   const logger = createLogger("whatsapp", config.logLevel);
+  const chatQueues = new KeyedAsyncQueue<string>();
 
   logger.info("Starting service", {
     authDir: config.authDir,
@@ -100,7 +102,7 @@ export async function startWhatsAppService({
         logger.info("Reconnecting");
         startWhatsAppService({ config, ollamaService }).catch((error) => logger.error("Reconnect failed", error));
       } else {
-        logger.warn("Logged out. Delete ./auth and scan again.");
+        logger.warn(`Logged out. Delete ${config.authDir} and scan again.`);
       }
     }
   });
@@ -119,7 +121,7 @@ export async function startWhatsAppService({
 
     for (const msg of messages) {
       try {
-        await handleIncomingMessage(sock, msg, ollamaService, logger);
+        await handleIncomingMessage(sock, msg, ollamaService, chatQueues, logger);
       } catch (error) {
         logger.error("Failed to handle message", {
           message: summarizeMessage(msg),
@@ -134,6 +136,7 @@ async function handleIncomingMessage(
   sock: WASocket,
   msg: WAMessage,
   ollamaService: OllamaService,
+  chatQueues: KeyedAsyncQueue<string>,
   logger: AppLogger,
 ): Promise<void> {
   const summary = summarizeMessage(msg);
@@ -244,8 +247,35 @@ async function handleIncomingMessage(
     promptPreview: previewText(prompt),
   });
 
+  await chatQueues.enqueue(chatId, () =>
+    generateSendAndRememberReply(sock, msg, ollamaService, logger, {
+      chatId,
+      sender: msg.key.participant ?? msg.key.remoteJid,
+      isGroup: group,
+      triggerType: trigger.type,
+      prompt,
+    }),
+  );
+}
+
+type AcceptedPrompt = {
+  chatId: string;
+  sender: string | null | undefined;
+  isGroup: boolean;
+  triggerType: "mention" | "reply";
+  prompt: string;
+};
+
+async function generateSendAndRememberReply(
+  sock: WASocket,
+  msg: WAMessage,
+  ollamaService: OllamaService,
+  logger: AppLogger,
+  acceptedPrompt: AcceptedPrompt,
+): Promise<void> {
+  const { chatId, sender, isGroup, triggerType, prompt } = acceptedPrompt;
   const startTime = Date.now();
-  const reply = await ollamaService.reply(chatId, prompt);
+  const reply = await ollamaService.generateReply(chatId, prompt);
   const elapsedMs = Date.now() - startTime;
   logger.debug("Received Ollama reply", {
     chatId,
@@ -266,14 +296,24 @@ async function handleIncomingMessage(
   await sock.sendMessage(chatId, { text: reply }, { quoted: msg });
   logger.info("Sent reply", {
     chatId,
-    sender: msg.key.participant ?? msg.key.remoteJid,
-    isGroup: group,
-    triggerType: trigger.type,
+    sender,
+    isGroup,
+    triggerType,
     elapsedMs,
     quotedMessageId: msg.key.id,
     promptLength: prompt.length,
     replyLength: reply.length,
   });
+
+  try {
+    await ollamaService.rememberExchange(chatId, prompt, reply);
+  } catch (error) {
+    logger.error("Failed to remember sent reply", {
+      chatId,
+      messageId: msg.key.id,
+      error,
+    });
+  }
 }
 
 function summarizeMessage(msg: WAMessage): Record<string, unknown> {

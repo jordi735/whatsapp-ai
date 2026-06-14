@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { AppConfig } from "../config.js";
+import { AsyncQueue } from "../utils/async-queue.js";
 import { isNodeError } from "../utils/errors.js";
 
 export type MemoryRole = "user" | "assistant";
@@ -19,6 +20,7 @@ export type MemoryStore = {
 type MemoryConfig = Pick<AppConfig, "memoryFile" | "memoryLimit">;
 
 export class MemoryService {
+  private readonly queue = new AsyncQueue();
   private readonly memoryDir: string;
 
   constructor(private readonly config: MemoryConfig) {
@@ -26,21 +28,25 @@ export class MemoryService {
   }
 
   async init(): Promise<void> {
-    await this.readMemory();
+    await this.queue.enqueue(() => this.readMemory());
   }
 
   async getHistory(chatId: string): Promise<MemoryMessage[]> {
-    const memory = await this.readMemory();
-    return memory.chats[chatId] ?? [];
+    return this.queue.enqueue(async () => {
+      const memory = await this.readMemory();
+      return memory.chats[chatId] ?? [];
+    });
   }
 
   async append(chatId: string, messages: MemoryMessage[]): Promise<void> {
-    const memory = await this.readMemory();
-    const existingMessages = memory.chats[chatId] ?? [];
+    await this.queue.enqueue(async () => {
+      const memory = await this.readMemory();
+      const existingMessages = memory.chats[chatId] ?? [];
 
-    memory.chats[chatId] = [...existingMessages, ...messages].slice(-this.config.memoryLimit);
+      memory.chats[chatId] = [...existingMessages, ...messages].slice(-this.config.memoryLimit);
 
-    await this.writeMemory(memory);
+      await this.writeMemory(memory);
+    });
   }
 
   private async readMemory(): Promise<MemoryStore> {
@@ -51,21 +57,23 @@ export class MemoryService {
       const parsed = JSON.parse(raw) as Partial<MemoryStore>;
 
       if (!parsed.chats || typeof parsed.chats !== "object") {
-        const emptyMemory: MemoryStore = { chats: {} };
-        await this.writeMemory(emptyMemory);
-        return emptyMemory;
+        return this.resetMemory();
       }
 
       return { chats: parsed.chats as Record<string, MemoryMessage[]> };
     } catch (error) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        const emptyMemory: MemoryStore = { chats: {} };
-        await this.writeMemory(emptyMemory);
-        return emptyMemory;
+        return this.resetMemory();
       }
 
       throw error;
     }
+  }
+
+  private async resetMemory(): Promise<MemoryStore> {
+    const emptyMemory: MemoryStore = { chats: {} };
+    await this.writeMemory(emptyMemory);
+    return emptyMemory;
   }
 
   private async writeMemory(memory: MemoryStore): Promise<void> {
