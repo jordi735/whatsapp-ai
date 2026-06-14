@@ -1,0 +1,38 @@
+{
+  "name": "whatsapp-ai",
+  "version": "1.0.0",
+  "description": "A small WhatsApp AI wrapper powered by Baileys and local Ollama.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "test": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jordi735/whatsapp-ai.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bugs": {
+    "url": "https://github.com/jordi735/whatsapp-ai/issues"
+  },
+  "homepage": "https://github.com/jordi735/whatsapp-ai#readme",
+  "dependencies": {
+    "baileys": "^7.0.0-rc13",
+    "dotenv": "^17.4.2",
+    "ollama": "^0.6.3",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^6.0.3"
+  }
+}
