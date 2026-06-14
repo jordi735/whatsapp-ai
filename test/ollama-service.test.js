@@ -9,12 +9,36 @@ import { OllamaService } from "../dist/services/ollama-service.js";
 
 test("generateReply uses history without writing memory", async (t) => {
   const memoryService = await createMemoryService(t);
-  await memoryService.append("chat-a", [memoryMessage("user", "old prompt")]);
+  await memoryService.appendThreadMessages("chat-a", {
+    threadId: "thread-a",
+    rootMessageId: "user-1",
+    messages: [
+      memoryMessage("user", "old prompt", {
+        id: "user-1",
+        senderName: "Alice",
+      }),
+      memoryMessage("assistant", "old reply", {
+        id: "bot-1",
+        parentMessageId: "user-1",
+      }),
+    ],
+  });
+  await memoryService.appendThreadMessages("chat-a", {
+    threadId: "thread-b",
+    rootMessageId: "user-2",
+    messages: [
+      memoryMessage("user", "unrelated prompt", {
+        id: "user-2",
+        senderName: "Mallory",
+      }),
+    ],
+  });
 
   const requests = [];
   const ollamaService = new OllamaService(
-    { ollamaModel: "fake-model", systemPrompt: "system prompt" },
+    { ollamaModel: "fake-model" },
     memoryService,
+    personalityService("system prompt", "default prompt"),
     {
       chat: async (request) => {
         requests.push(request);
@@ -23,37 +47,81 @@ test("generateReply uses history without writing memory", async (t) => {
     },
   );
 
-  assert.equal(await ollamaService.generateReply("chat-a", "new prompt"), "generated reply");
+  assert.equal(
+    await ollamaService.generateReply("chat-a", "new prompt", {
+      threadId: "thread-a",
+      senderName: "Bob",
+    }),
+    "generated reply",
+  );
   assert.deepEqual(
-    (await memoryService.getHistory("chat-a")).map(({ content }) => content),
-    ["old prompt"],
+    (await memoryService.getThreadHistory("chat-a", "thread-a")).map(({ content }) => content),
+    ["old prompt", "old reply"],
   );
   assert.deepEqual(requests[0]?.messages?.map(({ role, content }) => ({ role, content })), [
-    { role: "system", content: "system prompt" },
-    { role: "user", content: "old prompt" },
-    { role: "user", content: "new prompt" },
+    { role: "system", content: "system prompt\n\ndefault prompt" },
+    { role: "user", content: "Alice: old prompt" },
+    { role: "assistant", content: "old reply" },
+    { role: "user", content: "Bob: new prompt" },
   ]);
 });
 
 test("rememberExchange writes the delivered user and assistant turn", async (t) => {
   const memoryService = await createMemoryService(t);
   const ollamaService = new OllamaService(
-    { ollamaModel: "fake-model", systemPrompt: "system prompt" },
+    { ollamaModel: "fake-model" },
     memoryService,
+    personalityService("system prompt"),
     {
       chat: async () => chatResponse("unused"),
     },
   );
 
-  await ollamaService.rememberExchange("chat-a", "prompt", "reply");
+  await ollamaService.rememberExchange("chat-a", {
+    threadId: "thread-a",
+    rootMessageId: "user-1",
+    user: {
+      id: "user-1",
+      content: "prompt",
+      timestamp: new Date(0).toISOString(),
+      senderName: "Alice",
+    },
+    assistant: {
+      id: "bot-1",
+      content: "reply",
+      timestamp: new Date(1).toISOString(),
+      parentMessageId: "user-1",
+    },
+  });
 
   assert.deepEqual(
-    (await memoryService.getHistory("chat-a")).map(({ role, content }) => ({ role, content })),
+    (await memoryService.getThreadHistory("chat-a", "thread-a")).map(
+      ({ id, role, content, parentMessageId, senderName }) => ({
+        id,
+        role,
+        content,
+        parentMessageId,
+        senderName,
+      }),
+    ),
     [
-      { role: "user", content: "prompt" },
-      { role: "assistant", content: "reply" },
+      {
+        id: "user-1",
+        role: "user",
+        content: "prompt",
+        parentMessageId: undefined,
+        senderName: "Alice",
+      },
+      {
+        id: "bot-1",
+        role: "assistant",
+        content: "reply",
+        parentMessageId: "user-1",
+        senderName: undefined,
+      },
     ],
   );
+  assert.equal(await ollamaService.getThreadIdForMessage("chat-a", "bot-1"), "thread-a");
 });
 
 async function createMemoryService(t) {
@@ -68,11 +136,26 @@ async function createMemoryService(t) {
   });
 }
 
-function memoryMessage(role, content) {
+function memoryMessage(role, content, overrides = {}) {
   return {
+    id: content,
     role,
     content,
     timestamp: new Date(0).toISOString(),
+    ...overrides,
+  };
+}
+
+function personalityService(prompt, defaultPrompt = "default prompt") {
+  return {
+    getDefaultPrompt: () => defaultPrompt,
+    getActivePersonality: async () => ({
+      id: "test",
+      index: 1,
+      name: "test",
+      filePath: "/personalities/test.md",
+      prompt,
+    }),
   };
 }
 

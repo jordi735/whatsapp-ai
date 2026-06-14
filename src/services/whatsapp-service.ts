@@ -13,6 +13,7 @@ import { getDisconnectStatusCode } from "../utils/errors.js";
 import { createLogger, type AppLogger } from "../utils/logger.js";
 import { previewText } from "../utils/text.js";
 import { getBotIdentity } from "../whatsapp/bot-identity.js";
+import { parseSlashCommand, type SlashCommand } from "../whatsapp/command-parser.js";
 import {
   extractMessage,
   getBotTrigger,
@@ -20,18 +21,21 @@ import {
   isGroupJid,
   stripBotMentions,
 } from "../whatsapp/message-parser.js";
-import type { OllamaService } from "./ollama-service.js";
+import type { GenerateReplyOptions, OllamaService, RememberExchangeInput } from "./ollama-service.js";
+import type { Personality, PersonalityService } from "./personality-service.js";
 
 type WhatsAppServiceConfig = Pick<AppConfig, "authDir" | "baileysLogLevel" | "logLevel">;
 
 type StartWhatsAppServiceOptions = {
   config: WhatsAppServiceConfig;
   ollamaService: OllamaService;
+  personalityService: PersonalityService;
 };
 
 export async function startWhatsAppService({
   config,
   ollamaService,
+  personalityService,
 }: StartWhatsAppServiceOptions): Promise<void> {
   const logger = createLogger("whatsapp", config.logLevel);
   const chatQueues = new KeyedAsyncQueue<string>();
@@ -100,7 +104,9 @@ export async function startWhatsAppService({
 
       if (shouldReconnect) {
         logger.info("Reconnecting");
-        startWhatsAppService({ config, ollamaService }).catch((error) => logger.error("Reconnect failed", error));
+        startWhatsAppService({ config, ollamaService, personalityService }).catch((error) =>
+          logger.error("Reconnect failed", error),
+        );
       } else {
         logger.warn(`Logged out. Delete ${config.authDir} and scan again.`);
       }
@@ -121,7 +127,7 @@ export async function startWhatsAppService({
 
     for (const msg of messages) {
       try {
-        await handleIncomingMessage(sock, msg, ollamaService, chatQueues, logger);
+        await handleIncomingMessage(sock, msg, ollamaService, personalityService, chatQueues, logger);
       } catch (error) {
         logger.error("Failed to handle message", {
           message: summarizeMessage(msg),
@@ -136,6 +142,7 @@ async function handleIncomingMessage(
   sock: WASocket,
   msg: WAMessage,
   ollamaService: OllamaService,
+  personalityService: PersonalityService,
   chatQueues: KeyedAsyncQueue<string>,
   logger: AppLogger,
 ): Promise<void> {
@@ -158,6 +165,12 @@ async function handleIncomingMessage(
     return;
   }
 
+  const messageId = msg.key.id;
+  if (!messageId) {
+    logger.debug("Ignoring message because message id is missing", summary);
+    return;
+  }
+
   const botIdentity = getBotIdentity(sock);
   if (botIdentity.jids.length === 0) {
     logger.warn("Received a message before the bot JID was available", {
@@ -171,13 +184,14 @@ async function handleIncomingMessage(
   const { text, contextInfo, contentType } = extractMessage(msg.message);
   const incomingText = text.trim();
   const group = isGroupJid(chatId);
+  const sender = msg.key.participant ?? msg.key.remoteJid;
   const mentionedJids = contextInfo?.mentionedJid ?? [];
   const trigger = getBotTrigger(group, contextInfo, botIdentity.jids);
 
   logger.debug("Parsed message", {
-    messageId: msg.key.id,
+    messageId,
     chatId,
-    sender: msg.key.participant ?? msg.key.remoteJid,
+    sender,
     botJids: botIdentity.jids,
     botIdentitySources: botIdentity.sources,
     socketUserId: sock.user?.id,
@@ -206,7 +220,7 @@ async function handleIncomingMessage(
 
   if (!trigger) {
     logger.debug("Ignoring message because it did not trigger the bot", {
-      messageId: msg.key.id,
+      messageId,
       chatId,
       isGroup: group,
       botJids: botIdentity.jids,
@@ -220,7 +234,7 @@ async function handleIncomingMessage(
   const prompt = trigger.type === "mention" ? stripBotMentions(incomingText, botIdentity.jids) : incomingText;
   if (!prompt) {
     logger.debug("Ignoring message because prompt is empty after stripping bot mention", {
-      messageId: msg.key.id,
+      messageId,
       chatId,
       incomingText,
       botJids: botIdentity.jids,
@@ -228,32 +242,64 @@ async function handleIncomingMessage(
     return;
   }
 
-  logger.debug("Sending prompt to Ollama", {
+  const command = parseSlashCommand(prompt);
+  const acceptedPrompt = createAcceptedPrompt({
     chatId,
-    sender: msg.key.participant ?? msg.key.remoteJid,
+    sender,
     isGroup: group,
     triggerType: trigger.type,
+    prompt,
+    messageId,
+    parentMessageId: contextInfo?.stanzaId ?? undefined,
+    senderName: normalizeText(msg.pushName),
+    timestamp: getMessageTimestampIso(msg),
+  });
+
+  if (command) {
+    logger.info("Accepted command", {
+      chatId,
+      sender,
+      isGroup: group,
+      triggerType: trigger.type,
+      messageId,
+      commandType: command.type,
+      promptPreview: previewText(prompt),
+    });
+
+    await chatQueues.enqueue(chatId, () =>
+      handleSlashCommand(sock, msg, personalityService, logger, {
+        ...acceptedPrompt,
+        command,
+      }),
+    );
+    return;
+  }
+
+  logger.debug("Sending prompt to Ollama", {
+    chatId,
+    sender,
+    isGroup: group,
+    triggerType: trigger.type,
+    messageId,
+    parentMessageId: acceptedPrompt.parentMessageId,
+    senderName: acceptedPrompt.senderName,
     promptLength: prompt.length,
     prompt,
   });
 
   logger.info("Accepted message", {
     chatId,
-    sender: msg.key.participant ?? msg.key.remoteJid,
+    sender,
     isGroup: group,
     triggerType: trigger.type,
-    messageId: msg.key.id,
+    messageId,
     promptLength: prompt.length,
     promptPreview: previewText(prompt),
   });
 
   await chatQueues.enqueue(chatId, () =>
     generateSendAndRememberReply(sock, msg, ollamaService, logger, {
-      chatId,
-      sender: msg.key.participant ?? msg.key.remoteJid,
-      isGroup: group,
-      triggerType: trigger.type,
-      prompt,
+      ...acceptedPrompt,
     }),
   );
 }
@@ -264,7 +310,76 @@ type AcceptedPrompt = {
   isGroup: boolean;
   triggerType: "mention" | "reply";
   prompt: string;
+  messageId: string;
+  timestamp: string;
+  parentMessageId?: string;
+  senderName?: string;
 };
+
+type AcceptedCommand = AcceptedPrompt & {
+  command: SlashCommand;
+};
+
+type AcceptedPromptInput = Omit<AcceptedPrompt, "parentMessageId" | "senderName"> & {
+  parentMessageId?: string | undefined;
+  senderName?: string | undefined;
+};
+
+async function handleSlashCommand(
+  sock: WASocket,
+  msg: WAMessage,
+  personalityService: PersonalityService,
+  logger: AppLogger,
+  acceptedCommand: AcceptedCommand,
+): Promise<void> {
+  const { chatId, sender, isGroup, triggerType, command } = acceptedCommand;
+  const reply = await createSlashCommandReply(personalityService, chatId, command);
+
+  await sock.sendMessage(chatId, { text: reply }, { quoted: msg });
+  logger.info("Handled command", {
+    chatId,
+    sender,
+    isGroup,
+    triggerType,
+    commandType: command.type,
+    quotedMessageId: msg.key.id,
+    replyLength: reply.length,
+  });
+}
+
+async function createSlashCommandReply(
+  personalityService: PersonalityService,
+  chatId: string,
+  command: SlashCommand,
+): Promise<string> {
+  switch (command.type) {
+    case "list-personalities": {
+      const currentPersonality = await personalityService.getActivePersonality(chatId);
+      return formatPersonalityList(personalityService.listPersonalities(), currentPersonality);
+    }
+    case "set-personality": {
+      const personality = await personalityService.setActivePersonalityByNumber(chatId, command.number);
+      if (!personality) {
+        return `No personality ${command.number}. Use /personality to see available options.`;
+      }
+
+      return `Personality set to ${personality.index}. ${personality.name}`;
+    }
+    case "invalid-personality":
+      return "Invalid personality number. Use /personality to see available options.";
+    case "unknown":
+      return "Unknown command. Available commands: /personality";
+  }
+}
+
+function formatPersonalityList(personalities: readonly Personality[], currentPersonality: Personality): string {
+  const personalityLines = personalities.map((personality) => {
+    const currentSuffix = personality.id === currentPersonality.id ? " (current)" : "";
+    return `${personality.index}. ${personality.name}${currentSuffix}`;
+  });
+
+  return ["Personalities:", ...personalityLines, "", "Use /personality <number> to switch."].join("\n");
+}
 
 async function generateSendAndRememberReply(
   sock: WASocket,
@@ -273,13 +388,30 @@ async function generateSendAndRememberReply(
   logger: AppLogger,
   acceptedPrompt: AcceptedPrompt,
 ): Promise<void> {
-  const { chatId, sender, isGroup, triggerType, prompt } = acceptedPrompt;
+  const { chatId, sender, isGroup, triggerType, prompt, messageId, senderName } = acceptedPrompt;
+  const threadTarget = await resolveThreadTarget(ollamaService, acceptedPrompt);
+
+  if (!threadTarget) {
+    logger.debug("Ignoring reply because quoted message is not in memory", {
+      chatId,
+      messageId,
+      parentMessageId: acceptedPrompt.parentMessageId,
+    });
+    return;
+  }
+
+  const generateOptions: GenerateReplyOptions = { threadId: threadTarget.threadId };
+  if (senderName) {
+    generateOptions.senderName = senderName;
+  }
+
   const startTime = Date.now();
-  const reply = await ollamaService.generateReply(chatId, prompt);
+  const reply = await ollamaService.generateReply(chatId, prompt, generateOptions);
   const elapsedMs = Date.now() - startTime;
   logger.debug("Received Ollama reply", {
     chatId,
-    messageId: msg.key.id,
+    messageId,
+    threadId: threadTarget.threadId,
     elapsedMs,
     replyLength: reply.length,
     reply,
@@ -288,32 +420,164 @@ async function generateSendAndRememberReply(
   if (!reply) {
     logger.warn("Not sending an empty Ollama reply", {
       chatId,
-      messageId: msg.key.id,
+      messageId,
+      threadId: threadTarget.threadId,
     });
     return;
   }
 
-  await sock.sendMessage(chatId, { text: reply }, { quoted: msg });
+  const sentMessage = await sock.sendMessage(chatId, { text: reply }, { quoted: msg });
+  const sentMessageId = sentMessage?.key.id;
   logger.info("Sent reply", {
     chatId,
     sender,
     isGroup,
     triggerType,
+    threadId: threadTarget.threadId,
     elapsedMs,
-    quotedMessageId: msg.key.id,
+    quotedMessageId: messageId,
+    sentMessageId,
     promptLength: prompt.length,
     replyLength: reply.length,
   });
 
+  if (!sentMessageId) {
+    logger.warn("Sent reply was not remembered because Baileys did not return a message id", {
+      chatId,
+      messageId,
+      threadId: threadTarget.threadId,
+    });
+    return;
+  }
+
   try {
-    await ollamaService.rememberExchange(chatId, prompt, reply);
+    await ollamaService.rememberExchange(chatId, {
+      threadId: threadTarget.threadId,
+      rootMessageId: threadTarget.rootMessageId,
+      user: createUserMemoryMessage(acceptedPrompt),
+      assistant: createAssistantMemoryMessage({
+        id: sentMessageId,
+        content: reply,
+        parentMessageId: messageId,
+      }),
+    });
   } catch (error) {
     logger.error("Failed to remember sent reply", {
       chatId,
-      messageId: msg.key.id,
+      messageId,
+      sentMessageId,
+      threadId: threadTarget.threadId,
       error,
     });
   }
+}
+
+type ThreadTarget = {
+  threadId: string;
+  rootMessageId: string;
+};
+
+function createAcceptedPrompt(input: AcceptedPromptInput): AcceptedPrompt {
+  const acceptedPrompt: AcceptedPrompt = {
+    chatId: input.chatId,
+    sender: input.sender,
+    isGroup: input.isGroup,
+    triggerType: input.triggerType,
+    prompt: input.prompt,
+    messageId: input.messageId,
+    timestamp: input.timestamp,
+  };
+
+  if (input.parentMessageId) {
+    acceptedPrompt.parentMessageId = input.parentMessageId;
+  }
+
+  if (input.senderName) {
+    acceptedPrompt.senderName = input.senderName;
+  }
+
+  return acceptedPrompt;
+}
+
+async function resolveThreadTarget(
+  ollamaService: OllamaService,
+  acceptedPrompt: AcceptedPrompt,
+): Promise<ThreadTarget | undefined> {
+  if (acceptedPrompt.triggerType === "mention") {
+    return {
+      threadId: acceptedPrompt.messageId,
+      rootMessageId: acceptedPrompt.messageId,
+    };
+  }
+
+  if (!acceptedPrompt.parentMessageId) {
+    return undefined;
+  }
+
+  const threadId = await ollamaService.getThreadIdForMessage(
+    acceptedPrompt.chatId,
+    acceptedPrompt.parentMessageId,
+  );
+
+  if (!threadId) {
+    return undefined;
+  }
+
+  return {
+    threadId,
+    rootMessageId: threadId,
+  };
+}
+
+function createUserMemoryMessage(acceptedPrompt: AcceptedPrompt): RememberExchangeInput["user"] {
+  const message: RememberExchangeInput["user"] = {
+    id: acceptedPrompt.messageId,
+    content: acceptedPrompt.prompt,
+    timestamp: acceptedPrompt.timestamp,
+  };
+
+  if (acceptedPrompt.parentMessageId) {
+    message.parentMessageId = acceptedPrompt.parentMessageId;
+  }
+
+  if (acceptedPrompt.sender) {
+    message.senderJid = acceptedPrompt.sender;
+  }
+
+  if (acceptedPrompt.senderName) {
+    message.senderName = acceptedPrompt.senderName;
+  }
+
+  return message;
+}
+
+function createAssistantMemoryMessage(input: {
+  id: string;
+  content: string;
+  parentMessageId: string;
+}): RememberExchangeInput["assistant"] {
+  return {
+    id: input.id,
+    content: input.content,
+    timestamp: new Date().toISOString(),
+    parentMessageId: input.parentMessageId,
+  };
+}
+
+function getMessageTimestampIso(msg: WAMessage): string {
+  const timestamp = msg.messageTimestamp?.toString();
+  const seconds = timestamp ? Number(timestamp) : NaN;
+
+  if (!Number.isFinite(seconds)) {
+    return new Date().toISOString();
+  }
+
+  return new Date(seconds * 1000).toISOString();
+}
+
+function normalizeText(text: string | null | undefined): string | undefined {
+  const trimmedText = text?.trim();
+  return trimmedText || undefined;
 }
 
 function summarizeMessage(msg: WAMessage): Record<string, unknown> {
