@@ -4,7 +4,7 @@ import type { AppConfig } from "../config.js";
 import type { MemoryMessage, MemoryService } from "./memory-service.js";
 import type { PersonalityService } from "./personality-service.js";
 
-type OllamaConfig = Pick<AppConfig, "ollamaModel">;
+type OllamaConfig = Pick<AppConfig, "ollamaContextSize" | "ollamaModel">;
 type OllamaChatClient = {
   chat: (request: ChatRequest & { stream?: false }) => Promise<ChatResponse>;
 };
@@ -47,6 +47,9 @@ export class OllamaService {
         ...history.map(formatMemoryMessage),
         { role: "user", content: formatUserContent(prompt, options.senderName) },
       ],
+      ...(this.config.ollamaContextSize === undefined
+        ? {}
+        : { options: { num_ctx: this.config.ollamaContextSize } }),
     });
 
     return response.message.content.trim();

@@ -66,6 +66,26 @@ test("generateReply uses history without writing memory", async (t) => {
   ]);
 });
 
+test("generateReply passes configured Ollama context size", async (t) => {
+  const memoryService = await createMemoryService(t);
+  const requests = [];
+  const ollamaService = new OllamaService(
+    { ollamaModel: "fake-model", ollamaContextSize: 32768 },
+    memoryService,
+    personalityService("system prompt"),
+    {
+      chat: async (request) => {
+        requests.push(request);
+        return chatResponse("reply");
+      },
+    },
+  );
+
+  await ollamaService.generateReply("chat-a", "prompt", { threadId: "thread-a" });
+
+  assert.deepEqual(requests[0]?.options, { num_ctx: 32768 });
+});
+
 test("rememberExchange writes the delivered user and assistant turn", async (t) => {
   const memoryService = await createMemoryService(t);
   const ollamaService = new OllamaService(

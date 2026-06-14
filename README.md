@@ -49,12 +49,14 @@ Environment variables:
 
 ```env
 OLLAMA_MODEL=phi
+OLLAMA_CONTEXT_SIZE=32768
 DEFAULT_PERSONALITY=alex-jones
 BAILEYS_LOG_LEVEL=silent
 LOG_LEVEL=info
 ```
 
 - `OLLAMA_MODEL`: Ollama model used for replies.
+- `OLLAMA_CONTEXT_SIZE`: optional Ollama context window size, passed as `num_ctx`. Use `32768` for 32k.
 - `DEFAULT_PERSONALITY`: default personality id from `personalities/<id>.md`, without the `.md` extension. Startup fails if this file is missing or empty.
 - `BAILEYS_LOG_LEVEL`: Baileys internal log level. Keep `silent` unless debugging connection issues.
 - `LOG_LEVEL`: app log level: `debug`, `info`, `warn`, `error`, or `silent`.
