@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Node.js 20+ TypeScript project that runs as an ES module app. Source lives in `src/`, with `src/index.ts` as the entry point. Configuration is centralized in `src/config.ts`. Long-lived integrations belong in `src/services/` (`whatsapp-service`, `ollama-service`, `memory-service`, `chat-history-service`, `personality-service`), WhatsApp parsing, slash command parsing, and identity helpers belong in `src/whatsapp/`, and shared helpers belong in `src/utils/`.
+This is a Node.js 20+ TypeScript project that runs as an ES module app. Source lives in `src/`, with `src/index.ts` as the entry point. Configuration is centralized in `src/config.ts`. Long-lived integrations belong in `src/services/` (`whatsapp-service`, `ollama-service`, `memory-service`, `chat-history-service`, `personality-service`), WhatsApp parsing, slash command parsing, image/media preparation, and identity helpers belong in `src/whatsapp/`, and shared helpers belong in `src/utils/`.
 
 Prompt files live in `personalities/`. Treat `personalities/_default.md` as required shared instructions, and treat other non-empty `*.md` files as selectable personalities whose filename stems are used as personality IDs.
 
@@ -17,6 +17,8 @@ Generated or local runtime state is not source: `dist/` is compiler output, `aut
 
 Run Ollama locally with the model configured by `OLLAMA_MODEL` before starting the bot. `DEFAULT_PERSONALITY` must match a selectable `personalities/<id>.md` filename stem. On first WhatsApp startup, scan the terminal QR code to create `auth/`.
 
+Image prompts require `OLLAMA_MODEL` to be vision-capable. WhatsApp images are downloaded only for accepted prompts, resized with `sharp` so the widest edge is at most 1536px, capped at 5 MB after preparation, and passed transiently to Ollama. Keep this image pipeline in `src/whatsapp/media-message.ts` and the socket/download orchestration in `src/services/whatsapp-service.ts`.
+
 ## Coding Style & Naming Conventions
 
 Use strict TypeScript and ES module imports. Because `tsconfig.json` uses `module: "nodenext"`, local imports should include `.js` extensions, for example `import { loadConfig } from "./config.js"`.
@@ -27,7 +29,7 @@ Follow the existing style: two-space indentation, double quotes, semicolons, `ca
 
 Use `npm test` as the minimum pre-commit check. Tests are JavaScript files under `test/` that use `node:test` and import compiled modules from `dist/`, so the build step is part of test execution. Name tests as `*.test.js` files that mirror the module under test, such as `message-parser.test.js`.
 
-Prioritize pure parsing, slash command parsing, personality loading and selection, threaded memory, persistent summary chat history, reply-thread resolution, Ollama prompt composition, and error-handling logic before integration tests that require WhatsApp or Ollama.
+Prioritize pure parsing, slash command parsing, image/media selection and preparation, personality loading and selection, threaded memory, persistent summary chat history, reply-thread resolution, Ollama prompt composition, and error-handling logic before integration tests that require WhatsApp or Ollama.
 
 ## Commit & Pull Request Guidelines
 
@@ -37,4 +39,4 @@ Pull requests should include a brief description, testing performed (`npm test`,
 
 ## Security & Configuration Tips
 
-Never commit `.env`, `auth/`, `data/`, chat memory, summary chat history, or personality selection state. Avoid logging full message contents unless needed for debugging, and prefer `.env.example` placeholders over real model names, phone numbers, tokens, or JIDs. Be aware that debug logging can include full prompts, full replies, sender identifiers, push names, auth identity details, and message metadata.
+Never commit `.env`, `auth/`, `data/`, chat memory, summary chat history, personality selection state, or downloaded image bytes. Avoid logging full message contents unless needed for debugging, and prefer `.env.example` placeholders over real model names, phone numbers, tokens, or JIDs. Image bytes, base64 payloads, media keys, direct paths, and WhatsApp media URLs must not be logged. Be aware that debug logging can include full prompts, full replies, sender identifiers, push names, auth identity details, and message metadata.
