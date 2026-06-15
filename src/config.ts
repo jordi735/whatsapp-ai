@@ -5,6 +5,7 @@ import { parseLogLevel, type LogLevel } from "./utils/logger.js";
 export type AppConfig = {
   authDir: string;
   baileysLogLevel: string;
+  chatHistoryFile: string;
   dataDir: string;
   defaultPersonalityId: string;
   defaultPromptFile: string;
@@ -29,14 +30,15 @@ export function loadConfig(): AppConfig {
   return {
     authDir: "./auth",
     baileysLogLevel: process.env.BAILEYS_LOG_LEVEL ?? "silent",
+    chatHistoryFile: path.join(DATA_DIR, "chat-history.json"),
     dataDir: DATA_DIR,
-    defaultPersonalityId: process.env.DEFAULT_PERSONALITY ?? "alex-jones",
+    defaultPersonalityId: process.env.DEFAULT_PERSONALITY ?? "assistant",
     defaultPromptFile: path.join(PERSONALITIES_DIR, "_default.md"),
     logLevel: parseLogLevel(process.env.LOG_LEVEL),
     memoryFile: path.join(DATA_DIR, "memory.json"),
     memoryLimit: 20,
     ...(ollamaContextSize === undefined ? {} : { ollamaContextSize }),
-    ollamaModel: process.env.OLLAMA_MODEL ?? "phi",
+    ollamaModel: process.env.OLLAMA_MODEL ?? "gemma4:e4b",
     personalitiesDir: PERSONALITIES_DIR,
     personalitySelectionsFile: path.join(DATA_DIR, "personality-selections.json"),
   };

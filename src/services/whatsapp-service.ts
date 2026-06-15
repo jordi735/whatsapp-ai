@@ -11,28 +11,39 @@ import type { AppConfig } from "../config.js";
 import { KeyedAsyncQueue } from "../utils/async-queue.js";
 import { getDisconnectStatusCode } from "../utils/errors.js";
 import { createLogger, type AppLogger } from "../utils/logger.js";
+import { SUMMARY_MESSAGE_LIMIT } from "../utils/summary.js";
 import { previewText } from "../utils/text.js";
 import { getBotIdentity } from "../whatsapp/bot-identity.js";
 import { parseSlashCommand, type SlashCommand } from "../whatsapp/command-parser.js";
 import {
   extractMessage,
+  extractQuotedMessageContext,
+  formatPromptWithQuotedMessage,
   getBotTrigger,
   getMessageContentType,
   isGroupJid,
   stripBotMentions,
 } from "../whatsapp/message-parser.js";
-import type { GenerateReplyOptions, OllamaService, RememberExchangeInput } from "./ollama-service.js";
+import type { ChatHistoryService, RecentChatMessage } from "./chat-history-service.js";
+import type {
+  GenerateReplyOptions,
+  GenerateSummaryOptions,
+  OllamaService,
+  RememberExchangeInput,
+} from "./ollama-service.js";
 import type { Personality, PersonalityService } from "./personality-service.js";
 
 type WhatsAppServiceConfig = Pick<AppConfig, "authDir" | "baileysLogLevel" | "logLevel">;
 
 type StartWhatsAppServiceOptions = {
+  chatHistoryService: ChatHistoryService;
   config: WhatsAppServiceConfig;
   ollamaService: OllamaService;
   personalityService: PersonalityService;
 };
 
 export async function startWhatsAppService({
+  chatHistoryService,
   config,
   ollamaService,
   personalityService,
@@ -104,7 +115,7 @@ export async function startWhatsAppService({
 
       if (shouldReconnect) {
         logger.info("Reconnecting");
-        startWhatsAppService({ config, ollamaService, personalityService }).catch((error) =>
+        startWhatsAppService({ chatHistoryService, config, ollamaService, personalityService }).catch((error) =>
           logger.error("Reconnect failed", error),
         );
       } else {
@@ -127,7 +138,15 @@ export async function startWhatsAppService({
 
     for (const msg of messages) {
       try {
-        await handleIncomingMessage(sock, msg, ollamaService, personalityService, chatQueues, logger);
+        await handleIncomingMessage(
+          sock,
+          msg,
+          chatHistoryService,
+          ollamaService,
+          personalityService,
+          chatQueues,
+          logger,
+        );
       } catch (error) {
         logger.error("Failed to handle message", {
           message: summarizeMessage(msg),
@@ -141,6 +160,7 @@ export async function startWhatsAppService({
 async function handleIncomingMessage(
   sock: WASocket,
   msg: WAMessage,
+  chatHistoryService: ChatHistoryService,
   ollamaService: OllamaService,
   personalityService: PersonalityService,
   chatQueues: KeyedAsyncQueue<string>,
@@ -219,6 +239,18 @@ async function handleIncomingMessage(
   }
 
   if (!trigger) {
+    if (group && !parseSlashCommand(incomingText)) {
+      await rememberIncomingChatHistoryMessage(chatHistoryService, logger, {
+        chatId,
+        contentType,
+        messageId,
+        sender,
+        senderName: normalizeText(msg.pushName),
+        text: incomingText,
+        timestamp: getMessageTimestampIso(msg),
+      });
+    }
+
     logger.debug("Ignoring message because it did not trigger the bot", {
       messageId,
       chatId,
@@ -243,12 +275,15 @@ async function handleIncomingMessage(
   }
 
   const command = parseSlashCommand(prompt);
+  const quotedMessageContext =
+    !command && trigger.type === "mention" ? extractQuotedMessageContext(contextInfo) : undefined;
+  const acceptedPromptText = formatPromptWithQuotedMessage(prompt, quotedMessageContext);
   const acceptedPrompt = createAcceptedPrompt({
     chatId,
     sender,
     isGroup: group,
     triggerType: trigger.type,
-    prompt,
+    prompt: acceptedPromptText,
     messageId,
     parentMessageId: contextInfo?.stanzaId ?? undefined,
     senderName: normalizeText(msg.pushName),
@@ -267,13 +302,23 @@ async function handleIncomingMessage(
     });
 
     await chatQueues.enqueue(chatId, () =>
-      handleSlashCommand(sock, msg, personalityService, logger, {
+      handleSlashCommand(sock, msg, chatHistoryService, ollamaService, personalityService, logger, {
         ...acceptedPrompt,
         command,
       }),
     );
     return;
   }
+
+  await rememberIncomingChatHistoryMessage(chatHistoryService, logger, {
+    chatId,
+    contentType,
+    messageId,
+    sender,
+    senderName: acceptedPrompt.senderName,
+    text: prompt,
+    timestamp: acceptedPrompt.timestamp,
+  });
 
   logger.debug("Sending prompt to Ollama", {
     chatId,
@@ -283,8 +328,10 @@ async function handleIncomingMessage(
     messageId,
     parentMessageId: acceptedPrompt.parentMessageId,
     senderName: acceptedPrompt.senderName,
-    promptLength: prompt.length,
-    prompt,
+    quotedMessageContentType: quotedMessageContext?.contentType,
+    quotedMessageTextLength: quotedMessageContext?.text.length,
+    promptLength: acceptedPrompt.prompt.length,
+    prompt: acceptedPrompt.prompt,
   });
 
   logger.info("Accepted message", {
@@ -293,12 +340,13 @@ async function handleIncomingMessage(
     isGroup: group,
     triggerType: trigger.type,
     messageId,
-    promptLength: prompt.length,
-    promptPreview: previewText(prompt),
+    hasQuotedMessageContext: Boolean(quotedMessageContext),
+    promptLength: acceptedPrompt.prompt.length,
+    promptPreview: previewText(acceptedPrompt.prompt),
   });
 
   await chatQueues.enqueue(chatId, () =>
-    generateSendAndRememberReply(sock, msg, ollamaService, logger, {
+    generateSendAndRememberReply(sock, msg, chatHistoryService, ollamaService, logger, {
       ...acceptedPrompt,
     }),
   );
@@ -328,12 +376,20 @@ type AcceptedPromptInput = Omit<AcceptedPrompt, "parentMessageId" | "senderName"
 async function handleSlashCommand(
   sock: WASocket,
   msg: WAMessage,
+  chatHistoryService: ChatHistoryService,
+  ollamaService: OllamaService,
   personalityService: PersonalityService,
   logger: AppLogger,
   acceptedCommand: AcceptedCommand,
 ): Promise<void> {
   const { chatId, sender, isGroup, triggerType, command } = acceptedCommand;
-  const reply = await createSlashCommandReply(personalityService, chatId, command);
+  const reply = await createSlashCommandReply(
+    chatHistoryService,
+    ollamaService,
+    personalityService,
+    chatId,
+    command,
+  );
 
   await sock.sendMessage(chatId, { text: reply }, { quoted: msg });
   logger.info("Handled command", {
@@ -348,6 +404,8 @@ async function handleSlashCommand(
 }
 
 async function createSlashCommandReply(
+  chatHistoryService: ChatHistoryService,
+  ollamaService: OllamaService,
   personalityService: PersonalityService,
   chatId: string,
   command: SlashCommand,
@@ -367,8 +425,24 @@ async function createSlashCommandReply(
     }
     case "invalid-personality":
       return "Invalid personality number. Use /personality to see available options.";
+    case "summarize": {
+      const messages = await chatHistoryService.getRecentMessages(chatId, command.count);
+      if (messages.length === 0) {
+        return "No recent chat messages to summarize yet.";
+      }
+
+      const summaryOptions: GenerateSummaryOptions = { count: command.count };
+      if (command.instructions) {
+        summaryOptions.instructions = command.instructions;
+      }
+
+      const summary = await ollamaService.generateSummary(chatId, messages, summaryOptions);
+      return summary || "I could not generate a summary for those messages.";
+    }
+    case "invalid-summarize":
+      return `Invalid summarize command. Use /summarize <1-${SUMMARY_MESSAGE_LIMIT}> [instructions].`;
     case "unknown":
-      return "Unknown command. Available commands: /personality";
+      return "Unknown command. Available commands: /personality, /summarize";
   }
 }
 
@@ -384,6 +458,7 @@ function formatPersonalityList(personalities: readonly Personality[], currentPer
 async function generateSendAndRememberReply(
   sock: WASocket,
   msg: WAMessage,
+  chatHistoryService: ChatHistoryService,
   ollamaService: OllamaService,
   logger: AppLogger,
   acceptedPrompt: AcceptedPrompt,
@@ -450,6 +525,13 @@ async function generateSendAndRememberReply(
     return;
   }
 
+  await rememberAssistantChatHistoryMessage(chatHistoryService, logger, {
+    chatId,
+    content: reply,
+    id: sentMessageId,
+    senderJid: sock.user?.id ?? "bot",
+  });
+
   try {
     await ollamaService.rememberExchange(chatId, {
       threadId: threadTarget.threadId,
@@ -467,6 +549,76 @@ async function generateSendAndRememberReply(
       messageId,
       sentMessageId,
       threadId: threadTarget.threadId,
+      error,
+    });
+  }
+}
+
+async function rememberIncomingChatHistoryMessage(
+  chatHistoryService: ChatHistoryService,
+  logger: AppLogger,
+  input: {
+    chatId: string;
+    contentType: string | undefined;
+    messageId: string;
+    sender: string | null | undefined;
+    senderName: string | undefined;
+    text: string;
+    timestamp: string;
+  },
+): Promise<void> {
+  if (!input.sender) {
+    return;
+  }
+
+  const message: RecentChatMessage = {
+    id: input.messageId,
+    role: "user",
+    text: input.text,
+    timestamp: input.timestamp,
+    senderJid: input.sender,
+    contentType: input.contentType ?? "unknown",
+  };
+
+  if (input.senderName) {
+    message.senderName = input.senderName;
+  }
+
+  await rememberChatHistoryMessage(chatHistoryService, logger, input.chatId, message);
+}
+
+async function rememberAssistantChatHistoryMessage(
+  chatHistoryService: ChatHistoryService,
+  logger: AppLogger,
+  input: {
+    chatId: string;
+    content: string;
+    id: string;
+    senderJid: string;
+  },
+): Promise<void> {
+  await rememberChatHistoryMessage(chatHistoryService, logger, input.chatId, {
+    id: input.id,
+    role: "assistant",
+    text: input.content,
+    timestamp: new Date().toISOString(),
+    senderJid: input.senderJid,
+    contentType: "conversation",
+  });
+}
+
+async function rememberChatHistoryMessage(
+  chatHistoryService: ChatHistoryService,
+  logger: AppLogger,
+  chatId: string,
+  message: RecentChatMessage,
+): Promise<void> {
+  try {
+    await chatHistoryService.appendMessage(chatId, message);
+  } catch (error) {
+    logger.error("Failed to remember chat history message", {
+      chatId,
+      messageId: message.id,
       error,
     });
   }

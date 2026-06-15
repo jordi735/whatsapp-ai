@@ -86,6 +86,55 @@ test("generateReply passes configured Ollama context size", async (t) => {
   assert.deepEqual(requests[0]?.options, { num_ctx: 32768 });
 });
 
+test("generateSummary uses active personality and transcript without memory", async () => {
+  const requests = [];
+  const memoryService = {
+    getThreadHistory: async () => {
+      throw new Error("generateSummary should not read thread history");
+    },
+    getThreadIdForMessage: async () => undefined,
+    appendThreadMessages: async () => {
+      throw new Error("generateSummary should not write thread memory");
+    },
+  };
+  const ollamaService = new OllamaService(
+    { ollamaModel: "fake-model", ollamaContextSize: 32768 },
+    memoryService,
+    personalityService("system prompt", "default prompt"),
+    {
+      chat: async (request) => {
+        requests.push(request);
+        return chatResponse(" summary \n");
+      },
+    },
+  );
+
+  const summary = await ollamaService.generateSummary(
+    "chat-a",
+    [
+      recentChatMessage("user-1", "user", "first message", {
+        senderName: "Alice",
+        timestamp: new Date(0).toISOString(),
+      }),
+      recentChatMessage("bot-1", "assistant", "bot reply", {
+        timestamp: new Date(1).toISOString(),
+      }),
+    ],
+    { count: 5, instructions: "only bullet points" },
+  );
+
+  assert.equal(summary, "summary");
+  assert.deepEqual(requests[0]?.options, { num_ctx: 32768 });
+  assert.deepEqual(requests[0]?.messages?.map(({ role }) => role), ["system", "user"]);
+  assert.match(requests[0]?.messages?.[0]?.content, /system prompt/);
+  assert.match(requests[0]?.messages?.[0]?.content, /default prompt/);
+  assert.match(requests[0]?.messages?.[0]?.content, /summarizing recent WhatsApp chat messages/);
+  assert.match(requests[0]?.messages?.[1]?.content, /last 5 messages; 2 messages are available/);
+  assert.match(requests[0]?.messages?.[1]?.content, /Additional summary instructions:\nonly bullet points/);
+  assert.match(requests[0]?.messages?.[1]?.content, /\[1970-01-01T00:00:00.000Z\] Alice: first message/);
+  assert.match(requests[0]?.messages?.[1]?.content, /\[1970-01-01T00:00:00.001Z\] Bot: bot reply/);
+});
+
 test("rememberExchange writes the delivered user and assistant turn", async (t) => {
   const memoryService = await createMemoryService(t);
   const ollamaService = new OllamaService(
@@ -162,6 +211,18 @@ function memoryMessage(role, content, overrides = {}) {
     role,
     content,
     timestamp: new Date(0).toISOString(),
+    ...overrides,
+  };
+}
+
+function recentChatMessage(id, role, text, overrides = {}) {
+  return {
+    id,
+    role,
+    text,
+    timestamp: new Date(0).toISOString(),
+    senderJid: role === "assistant" ? "bot@s.whatsapp.net" : "alice@s.whatsapp.net",
+    contentType: "conversation",
     ...overrides,
   };
 }

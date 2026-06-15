@@ -1,0 +1,1 @@
+export const SUMMARY_MESSAGE_LIMIT = 1000;

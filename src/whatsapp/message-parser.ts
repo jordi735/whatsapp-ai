@@ -9,6 +9,13 @@ export type ExtractedMessage = {
   contentType: string | undefined;
 };
 
+export type QuotedMessageContext = {
+  text: string;
+  contentType: string | undefined;
+  stanzaId: string | undefined;
+  participant: string | undefined;
+};
+
 export type BotTrigger =
   | { type: "mention"; match: MentionMatch }
   | { type: "reply"; match: MentionMatch };
@@ -52,6 +59,45 @@ export function extractMessage(message: WAMessageContent | undefined | null): Ex
 
 export function getMessageContentType(content: WAMessageContent): string | undefined {
   return Object.keys(content).find((key) => content[key as keyof WAMessageContent] != null);
+}
+
+export function extractQuotedMessageContext(
+  contextInfo: WAContextInfo | undefined,
+): QuotedMessageContext | undefined {
+  if (!contextInfo?.quotedMessage) {
+    return undefined;
+  }
+
+  const quotedMessage = extractMessage(contextInfo.quotedMessage);
+  const quotedText = quotedMessage.text.trim();
+
+  if (!quotedText) {
+    return undefined;
+  }
+
+  return {
+    text: quotedText,
+    contentType: quotedMessage.contentType,
+    stanzaId: contextInfo.stanzaId ?? undefined,
+    participant: contextInfo.participant ?? undefined,
+  };
+}
+
+export function formatPromptWithQuotedMessage(
+  prompt: string,
+  quotedMessage: QuotedMessageContext | undefined,
+): string {
+  if (!quotedMessage) {
+    return prompt;
+  }
+
+  return [
+    "Quoted WhatsApp message:",
+    quotedMessage.text,
+    "",
+    "User request:",
+    prompt,
+  ].join("\n");
 }
 
 export function isGroupJid(jid: string | null | undefined): boolean {

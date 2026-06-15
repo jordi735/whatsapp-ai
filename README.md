@@ -25,10 +25,10 @@ Create a local environment file:
 cp .env.example .env
 ```
 
-Make sure the configured Ollama model is available. The default is `phi`:
+Make sure the configured Ollama model is available. The default is `gemma4:e4b`:
 
 ```bash
-ollama pull phi
+ollama pull gemma4:e4b
 ```
 
 Start the bot:
@@ -48,9 +48,9 @@ WhatsApp > Linked devices > Link a device
 Environment variables:
 
 ```env
-OLLAMA_MODEL=phi
+OLLAMA_MODEL=gemma4:e4b
 OLLAMA_CONTEXT_SIZE=32768
-DEFAULT_PERSONALITY=alex-jones
+DEFAULT_PERSONALITY=assistant
 BAILEYS_LOG_LEVEL=silent
 LOG_LEVEL=info
 ```
@@ -86,14 +86,15 @@ The shared default prompt lives at:
 personalities/_default.md
 ```
 
-The bot appends `_default.md` to every active character prompt. Use it for global rules like language, response length, WhatsApp formatting, and safety behavior. This file is required at startup.
+The bot appends `_default.md` to every active personality prompt. Use it for global rules like language, response length, WhatsApp formatting, and safety behavior. This file is required at startup.
 
 The bot loads other non-empty `*.md` files on startup, sorts them by filename, and uses the filename without `.md` as the personality name. `_default.md` is not selectable with `/personality`. With the bundled prompts, the command order is:
 
 ```text
 1. alex-jones
-2. dr-manhattan
-3. rich-piana
+2. assistant
+3. dr-manhattan
+4. rich-piana
 ```
 
 Adding or renaming personality files can change the numbers shown by `/personality`. The active personality is stored per WhatsApp group in:
@@ -107,10 +108,14 @@ Use slash commands in a group by mentioning the bot or replying to one of its re
 ```text
 /personality
 /personality 2
+/summarize 20
+/summarize 20 only bullet points
 ```
 
 - `/personality`: shows numbered personalities and marks the current one.
 - `/personality <number>`: sets that group's active personality.
+- `/summarize <number>`: summarizes up to the last `<number>` tracked messages in the group.
+- `/summarize <number> <instructions>`: summarizes those messages with extra guidance, such as bullet points or a sentence limit.
 
 Command replies are operational bot replies, not Ollama/personality responses. Any prompted text that starts with `/` is treated as a command; unknown slash commands do not fall through to Ollama.
 
@@ -125,6 +130,14 @@ data/memory.json
 The current implementation keeps short versioned per-thread histories in JSON. Mentioning the bot starts a new thread keyed by that message. Replying to a remembered bot message continues that thread; replying to an old or unremembered bot message is ignored.
 
 Invalid or legacy memory files reset to an empty store. Delete `data/memory.json` to reset memory manually.
+
+Summary history is stored separately in:
+
+```text
+data/chat-history.json
+```
+
+The summary history keeps up to 1000 recent non-command text or caption messages per group. It includes normal user messages and normal Ollama replies, but excludes slash command invocations and slash command replies. Invalid or legacy summary history files reset to an empty store. Delete `data/chat-history.json` to reset summary history manually.
 
 ## Auth State
 

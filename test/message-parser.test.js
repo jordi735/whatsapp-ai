@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { extractMessage, getBotTrigger } from "../dist/whatsapp/message-parser.js";
+import {
+  extractMessage,
+  extractQuotedMessageContext,
+  formatPromptWithQuotedMessage,
+  getBotTrigger,
+} from "../dist/whatsapp/message-parser.js";
 
 const botJid = "12345@s.whatsapp.net";
 
@@ -55,4 +60,82 @@ test("extractMessage reads document reply context", () => {
 
   assert.equal(extracted.text, "follow-up with attachment");
   assert.equal(getBotTrigger(true, extracted.contextInfo, [botJid])?.type, "reply");
+});
+
+test("extractQuotedMessageContext reads quoted conversation text", () => {
+  assert.deepEqual(
+    extractQuotedMessageContext({
+      stanzaId: "quoted-1",
+      participant: "alice@s.whatsapp.net",
+      quotedMessage: { conversation: " what is the weather today? " },
+    }),
+    {
+      text: "what is the weather today?",
+      contentType: "conversation",
+      stanzaId: "quoted-1",
+      participant: "alice@s.whatsapp.net",
+    },
+  );
+});
+
+test("extractQuotedMessageContext reads quoted extended text and media captions", () => {
+  assert.equal(
+    extractQuotedMessageContext({
+      quotedMessage: {
+        extendedTextMessage: {
+          text: "should I bring an umbrella?",
+        },
+      },
+    })?.text,
+    "should I bring an umbrella?",
+  );
+  assert.deepEqual(
+    extractQuotedMessageContext({
+      quotedMessage: {
+        imageMessage: {
+          caption: "clouds over the city",
+        },
+      },
+    }),
+    {
+      text: "clouds over the city",
+      contentType: "imageMessage",
+      stanzaId: undefined,
+      participant: undefined,
+    },
+  );
+});
+
+test("extractQuotedMessageContext ignores blank or non-text quotes", () => {
+  assert.equal(
+    extractQuotedMessageContext({
+      quotedMessage: { conversation: "   " },
+    }),
+    undefined,
+  );
+  assert.equal(
+    extractQuotedMessageContext({
+      quotedMessage: { imageMessage: {} },
+    }),
+    undefined,
+  );
+});
+
+test("formatPromptWithQuotedMessage includes quoted context when present", () => {
+  assert.equal(
+    formatPromptWithQuotedMessage("can you answer that?", {
+      text: "what is the weather today?",
+      contentType: "conversation",
+      stanzaId: "quoted-1",
+      participant: "alice@s.whatsapp.net",
+    }),
+    [
+      "Quoted WhatsApp message:",
+      "what is the weather today?",
+      "",
+      "User request:",
+      "can you answer that?",
+    ].join("\n"),
+  );
+  assert.equal(formatPromptWithQuotedMessage("can you answer that?", undefined), "can you answer that?");
 });
