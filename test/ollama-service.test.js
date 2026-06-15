@@ -64,6 +64,60 @@ test("generateReply uses history without writing memory", async (t) => {
     { role: "assistant", content: "old reply" },
     { role: "user", content: "Bob: new prompt" },
   ]);
+  assert.equal(requests[0]?.messages?.at(-1)?.images, undefined);
+});
+
+test("generateReply attaches images to the latest user message only", async (t) => {
+  const memoryService = await createMemoryService(t);
+  await memoryService.appendThreadMessages("chat-a", {
+    threadId: "thread-a",
+    rootMessageId: "user-1",
+    messages: [
+      memoryMessage("user", "old prompt", {
+        id: "user-1",
+        senderName: "Alice",
+      }),
+      memoryMessage("assistant", "old reply", {
+        id: "bot-1",
+        parentMessageId: "user-1",
+      }),
+    ],
+  });
+
+  const imageBytes = Buffer.from("fake-image");
+  const requests = [];
+  const ollamaService = new OllamaService(
+    { ollamaModel: "fake-model" },
+    memoryService,
+    personalityService("system prompt"),
+    {
+      chat: async (request) => {
+        requests.push(request);
+        return chatResponse("vision reply");
+      },
+    },
+  );
+
+  assert.equal(
+    await ollamaService.generateReply("chat-a", "what color is this?", {
+      threadId: "thread-a",
+      images: [imageBytes],
+    }),
+    "vision reply",
+  );
+
+  assert.equal(requests[0]?.model, "fake-model");
+  assert.deepEqual(requests[0]?.messages?.slice(0, -1).map(({ images }) => images), [
+    undefined,
+    undefined,
+    undefined,
+  ]);
+  assert.equal(requests[0]?.messages?.at(-1)?.content, "what color is this?");
+  assert.deepEqual(requests[0]?.messages?.at(-1)?.images, [imageBytes]);
+  assert.deepEqual(
+    (await memoryService.getThreadHistory("chat-a", "thread-a")).map(({ content }) => content),
+    ["old prompt", "old reply"],
+  );
 });
 
 test("generateReply passes configured Ollama context size", async (t) => {

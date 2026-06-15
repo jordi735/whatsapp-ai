@@ -1,4 +1,4 @@
-import { type WAContextInfo, type WAMessageContent } from "baileys";
+import { extractMessageContent, type WAContextInfo, type WAMessageContent } from "baileys";
 
 import { escapeRegExp } from "../utils/text.js";
 import { findBotMentionMatch, getJidUser, type MentionMatch } from "./bot-identity.js";
@@ -16,6 +16,10 @@ export type QuotedMessageContext = {
   participant: string | undefined;
 };
 
+export type FormatPromptWithQuotedMessageOptions = {
+  quotedImageAttached?: boolean;
+};
+
 export type BotTrigger =
   | { type: "mention"; match: MentionMatch }
   | { type: "reply"; match: MentionMatch };
@@ -23,15 +27,7 @@ export type BotTrigger =
 export function getMessageContent(
   message: WAMessageContent | undefined | null,
 ): WAMessageContent | undefined {
-  if (!message) return undefined;
-
-  return (
-    message.ephemeralMessage?.message ??
-    message.viewOnceMessage?.message ??
-    message.viewOnceMessageV2?.message ??
-    message.documentWithCaptionMessage?.message ??
-    message
-  );
+  return extractMessageContent(message);
 }
 
 export function extractMessage(message: WAMessageContent | undefined | null): ExtractedMessage {
@@ -86,14 +82,24 @@ export function extractQuotedMessageContext(
 export function formatPromptWithQuotedMessage(
   prompt: string,
   quotedMessage: QuotedMessageContext | undefined,
+  options: FormatPromptWithQuotedMessageOptions = {},
 ): string {
-  if (!quotedMessage) {
+  if (!quotedMessage && !options.quotedImageAttached) {
     return prompt;
   }
 
+  const quotedLines = ["Quoted WhatsApp message:"];
+
+  if (quotedMessage) {
+    quotedLines.push(quotedMessage.text);
+  }
+
+  if (options.quotedImageAttached) {
+    quotedLines.push("[Quoted image attached]");
+  }
+
   return [
-    "Quoted WhatsApp message:",
-    quotedMessage.text,
+    ...quotedLines,
     "",
     "User request:",
     prompt,

@@ -31,6 +31,8 @@ Make sure the configured Ollama model is available. The default is `gemma4:e4b`:
 ollama pull gemma4:e4b
 ```
 
+To analyze WhatsApp images, configure `OLLAMA_MODEL` to a vision-capable Ollama model.
+
 Start the bot:
 
 ```bash
@@ -55,7 +57,7 @@ BAILEYS_LOG_LEVEL=silent
 LOG_LEVEL=info
 ```
 
-- `OLLAMA_MODEL`: Ollama model used for replies.
+- `OLLAMA_MODEL`: Ollama model used for replies. Use a vision-capable model if you want the bot to analyze images.
 - `OLLAMA_CONTEXT_SIZE`: optional Ollama context window size, passed as `num_ctx`. Use `32768` for 32k.
 - `DEFAULT_PERSONALITY`: default personality id from `personalities/<id>.md`, without the `.md` extension. Startup fails if this file is missing or empty.
 - `BAILEYS_LOG_LEVEL`: Baileys internal log level. Keep `silent` unless debugging connection issues.
@@ -69,6 +71,8 @@ In group chats, it replies when:
 
 - someone directly mentions the bot, or
 - someone replies to a remembered message sent by the bot.
+
+If the triggering message contains a WhatsApp photo, the bot sends the current image plus the prompt text to Ollama. If someone mentions the bot while quoting another person’s image, the bot uses that quoted image, the quoted image caption/message, and the mentioner’s request. If the image prompt has no text beyond the bot mention, the bot uses `Analyze the attached image.` as the request. Before sending an image to Ollama, the bot resizes it so the widest edge is at most 1536px and enforces a 5 MB prepared-image limit. Image support is intentionally narrow in this version: it uses one image per prompt, not albums, stickers, videos, documents, or images in `/summarize`.
 
 The bot detects both WhatsApp phone-number JIDs and LID JIDs dynamically from Baileys auth state, so it should keep working if the linked account identity changes.
 
@@ -139,6 +143,8 @@ data/chat-history.json
 
 The summary history keeps up to 1000 recent non-command text or caption messages per group. It includes normal user messages and normal Ollama replies, but excludes slash command invocations and slash command replies. Invalid or legacy summary history files reset to an empty store. Delete `data/chat-history.json` to reset summary history manually.
 
+Image bytes are transient. They are downloaded from WhatsApp for the active request, sent to the configured local Ollama service, and not stored in `data/memory.json` or `data/chat-history.json`.
+
 ## Auth State
 
 WhatsApp auth credentials are stored in:
@@ -171,4 +177,4 @@ Use debug logging when diagnosing trigger detection:
 LOG_LEVEL=debug
 ```
 
-Debug logs include parsed message details, mention/reply matching, bot identity candidates, ignored-message reasons, full prompts, full Ollama replies, sender IDs, push names, auth identity details, and message metadata.
+Debug logs include parsed message details, mention/reply matching, bot identity candidates, ignored-message reasons, full prompts, full Ollama replies, sender IDs, push names, auth identity details, and message metadata. Image bytes, base64 payloads, and WhatsApp media URLs are not logged.

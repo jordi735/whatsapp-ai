@@ -12,6 +12,7 @@ type OllamaChatClient = {
 
 export type GenerateReplyOptions = {
   threadId: string;
+  images?: readonly Uint8Array[];
   senderName?: string;
 };
 
@@ -51,7 +52,7 @@ export class OllamaService {
       messages: [
         { role: "system", content: systemPrompt },
         ...history.map(formatMemoryMessage),
-        { role: "user", content: formatUserContent(prompt, options.senderName) },
+        createUserMessage(prompt, options),
       ],
       ...(this.config.ollamaContextSize === undefined
         ? {}
@@ -101,6 +102,22 @@ export class OllamaService {
       ],
     });
   }
+}
+
+function createUserMessage(
+  prompt: string,
+  options: GenerateReplyOptions,
+): { role: "user"; content: string; images?: Uint8Array[] } {
+  const message: { role: "user"; content: string; images?: Uint8Array[] } = {
+    role: "user",
+    content: formatUserContent(prompt, options.senderName),
+  };
+
+  if (options.images && options.images.length > 0) {
+    message.images = [...options.images];
+  }
+
+  return message;
 }
 
 function formatMemoryMessage({ role, content, senderName }: MemoryMessage): { role: MemoryMessage["role"]; content: string } {

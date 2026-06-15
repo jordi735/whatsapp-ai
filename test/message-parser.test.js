@@ -44,6 +44,27 @@ test("extractMessage reads wrapped document captions", () => {
   assert.equal(extracted.contentType, "documentMessage");
 });
 
+test("extractMessage reads wrapped view-once image captions", () => {
+  const contextInfo = { mentionedJid: [botJid] };
+  const message = {
+    viewOnceMessageV2: {
+      message: {
+        imageMessage: {
+          caption: "@12345 what color is this?",
+          contextInfo,
+        },
+      },
+    },
+  };
+
+  const extracted = extractMessage(message);
+
+  assert.equal(extracted.text, "@12345 what color is this?");
+  assert.equal(extracted.contextInfo, contextInfo);
+  assert.equal(extracted.contentType, "imageMessage");
+  assert.equal(getBotTrigger(true, extracted.contextInfo, [botJid])?.type, "mention");
+});
+
 test("extractMessage reads document reply context", () => {
   const contextInfo = {
     participant: botJid,
@@ -138,4 +159,39 @@ test("formatPromptWithQuotedMessage includes quoted context when present", () =>
     ].join("\n"),
   );
   assert.equal(formatPromptWithQuotedMessage("can you answer that?", undefined), "can you answer that?");
+});
+
+test("formatPromptWithQuotedMessage includes quoted image context", () => {
+  assert.equal(
+    formatPromptWithQuotedMessage(
+      "what color is this?",
+      {
+        text: "yellow banana",
+        contentType: "imageMessage",
+        stanzaId: "quoted-1",
+        participant: "alice@s.whatsapp.net",
+      },
+      { quotedImageAttached: true },
+    ),
+    [
+      "Quoted WhatsApp message:",
+      "yellow banana",
+      "[Quoted image attached]",
+      "",
+      "User request:",
+      "what color is this?",
+    ].join("\n"),
+  );
+  assert.equal(
+    formatPromptWithQuotedMessage("Analyze the attached image.", undefined, {
+      quotedImageAttached: true,
+    }),
+    [
+      "Quoted WhatsApp message:",
+      "[Quoted image attached]",
+      "",
+      "User request:",
+      "Analyze the attached image.",
+    ].join("\n"),
+  );
 });

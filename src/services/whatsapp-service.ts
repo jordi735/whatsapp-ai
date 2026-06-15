@@ -1,9 +1,11 @@
 import makeWASocket, {
   DisconnectReason,
+  downloadMediaMessage,
   useMultiFileAuthState,
   type WAMessage,
   type WASocket,
 } from "baileys";
+import type { ILogger } from "baileys/lib/Utils/logger.js";
 import P from "pino";
 import QRCode from "qrcode";
 
@@ -15,6 +17,18 @@ import { SUMMARY_MESSAGE_LIMIT } from "../utils/summary.js";
 import { previewText } from "../utils/text.js";
 import { getBotIdentity } from "../whatsapp/bot-identity.js";
 import { parseSlashCommand, type SlashCommand } from "../whatsapp/command-parser.js";
+import {
+  DEFAULT_IMAGE_PROMPT,
+  extractImageAttachmentInfo,
+  isImageByteSizeTooLarge,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_LONG_EDGE,
+  prepareImageForVision,
+  selectPromptImageSource,
+  type ImageAttachmentInfo,
+  type PromptImageSource,
+  type PreparedImageForVision,
+} from "../whatsapp/media-message.js";
 import {
   extractMessage,
   extractQuotedMessageContext,
@@ -34,6 +48,21 @@ import type {
 import type { Personality, PersonalityService } from "./personality-service.js";
 
 type WhatsAppServiceConfig = Pick<AppConfig, "authDir" | "baileysLogLevel" | "logLevel">;
+type BaileysLogger = ILogger;
+type ImageDownloadResult =
+  | { status: "none" }
+  | { status: "ok"; actualByteSize: number; bytes: Uint8Array }
+  | { status: "failed"; reply: string };
+
+const MAX_IMAGE_SIZE_LABEL = `${MAX_IMAGE_BYTES / (1024 * 1024)} MB`;
+const IMAGE_TOO_LARGE_REPLY = `I can only process one WhatsApp image up to ${MAX_IMAGE_SIZE_LABEL}.`;
+const IMAGE_DOWNLOAD_FAILURE_REPLY =
+  "I could not download that image from WhatsApp. Please resend it as a normal photo and try again.";
+const IMAGE_PREP_FAILURE_REPLY =
+  "I could not prepare that image for analysis. Please resend it as a normal photo and try again.";
+const IMAGE_MODEL_FAILURE_REPLY =
+  "The configured Ollama model could not process that image. Make sure OLLAMA_MODEL is vision-capable and try again.";
+const IMAGE_EMPTY_REPLY = "I could not generate a response for that image.";
 
 type StartWhatsAppServiceOptions = {
   chatHistoryService: ChatHistoryService;
@@ -58,10 +87,11 @@ export async function startWhatsAppService({
   });
 
   const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+  const baileysLogger = P({ level: config.baileysLogLevel });
 
   const sock = makeWASocket({
     auth: state,
-    logger: P({ level: config.baileysLogLevel }),
+    logger: baileysLogger,
     markOnlineOnConnect: false,
     getMessage: async () => undefined,
   });
@@ -146,6 +176,7 @@ export async function startWhatsAppService({
           personalityService,
           chatQueues,
           logger,
+          baileysLogger,
         );
       } catch (error) {
         logger.error("Failed to handle message", {
@@ -165,6 +196,7 @@ async function handleIncomingMessage(
   personalityService: PersonalityService,
   chatQueues: KeyedAsyncQueue<string>,
   logger: AppLogger,
+  baileysLogger: BaileysLogger,
 ): Promise<void> {
   const summary = summarizeMessage(msg);
   logger.debug("Handling incoming message", summary);
@@ -203,6 +235,8 @@ async function handleIncomingMessage(
 
   const { text, contextInfo, contentType } = extractMessage(msg.message);
   const incomingText = text.trim();
+  const currentImageAttachment = extractImageAttachmentInfo(msg.message);
+  const quotedImageAttachment = extractImageAttachmentInfo(contextInfo?.quotedMessage);
   const group = isGroupJid(chatId);
   const sender = msg.key.participant ?? msg.key.remoteJid;
   const mentionedJids = contextInfo?.mentionedJid ?? [];
@@ -218,6 +252,10 @@ async function handleIncomingMessage(
     contentType,
     topLevelContentType: getMessageContentType(msg.message),
     messageKeys: Object.keys(msg.message),
+    hasCurrentImageAttachment: Boolean(currentImageAttachment),
+    currentImageAttachment: currentImageAttachment ? summarizeImageAttachment(currentImageAttachment) : undefined,
+    hasQuotedImageAttachment: Boolean(quotedImageAttachment),
+    quotedImageAttachment: quotedImageAttachment ? summarizeImageAttachment(quotedImageAttachment) : undefined,
     isGroup: group,
     textLength: incomingText.length,
     text: incomingText,
@@ -229,8 +267,8 @@ async function handleIncomingMessage(
     trigger,
   });
 
-  if (!incomingText) {
-    logger.debug("Ignoring message because no text or caption was extracted", {
+  if (!incomingText && !currentImageAttachment && !quotedImageAttachment) {
+    logger.debug("Ignoring message because no text, caption, or image was extracted", {
       message: summary,
       contentType,
       topLevelContentType: getMessageContentType(msg.message),
@@ -239,7 +277,7 @@ async function handleIncomingMessage(
   }
 
   if (!trigger) {
-    if (group && !parseSlashCommand(incomingText)) {
+    if (group && incomingText && !parseSlashCommand(incomingText)) {
       await rememberIncomingChatHistoryMessage(chatHistoryService, logger, {
         chatId,
         contentType,
@@ -263,7 +301,16 @@ async function handleIncomingMessage(
     return;
   }
 
-  const prompt = trigger.type === "mention" ? stripBotMentions(incomingText, botIdentity.jids) : incomingText;
+  const strippedPrompt = trigger.type === "mention" ? stripBotMentions(incomingText, botIdentity.jids) : incomingText;
+  const promptImageSource = selectPromptImageSource({
+    chatId,
+    contextInfo,
+    currentImageAttachment,
+    currentMessage: msg,
+    quotedImageAttachment,
+    triggerType: trigger.type,
+  });
+  const prompt = strippedPrompt || (promptImageSource ? DEFAULT_IMAGE_PROMPT : "");
   if (!prompt) {
     logger.debug("Ignoring message because prompt is empty after stripping bot mention", {
       messageId,
@@ -277,7 +324,9 @@ async function handleIncomingMessage(
   const command = parseSlashCommand(prompt);
   const quotedMessageContext =
     !command && trigger.type === "mention" ? extractQuotedMessageContext(contextInfo) : undefined;
-  const acceptedPromptText = formatPromptWithQuotedMessage(prompt, quotedMessageContext);
+  const acceptedPromptText = formatPromptWithQuotedMessage(prompt, quotedMessageContext, {
+    quotedImageAttached: !command && promptImageSource?.source === "quoted",
+  });
   const acceptedPrompt = createAcceptedPrompt({
     chatId,
     sender,
@@ -285,6 +334,7 @@ async function handleIncomingMessage(
     triggerType: trigger.type,
     prompt: acceptedPromptText,
     messageId,
+    promptImageSource,
     parentMessageId: contextInfo?.stanzaId ?? undefined,
     senderName: normalizeText(msg.pushName),
     timestamp: getMessageTimestampIso(msg),
@@ -331,6 +381,7 @@ async function handleIncomingMessage(
     quotedMessageContentType: quotedMessageContext?.contentType,
     quotedMessageTextLength: quotedMessageContext?.text.length,
     promptLength: acceptedPrompt.prompt.length,
+    imageSource: acceptedPrompt.promptImageSource?.source,
     prompt: acceptedPrompt.prompt,
   });
 
@@ -341,12 +392,13 @@ async function handleIncomingMessage(
     triggerType: trigger.type,
     messageId,
     hasQuotedMessageContext: Boolean(quotedMessageContext),
+    imageSource: acceptedPrompt.promptImageSource?.source,
     promptLength: acceptedPrompt.prompt.length,
     promptPreview: previewText(acceptedPrompt.prompt),
   });
 
   await chatQueues.enqueue(chatId, () =>
-    generateSendAndRememberReply(sock, msg, chatHistoryService, ollamaService, logger, {
+    generateSendAndRememberReply(sock, msg, chatHistoryService, ollamaService, logger, baileysLogger, {
       ...acceptedPrompt,
     }),
   );
@@ -361,6 +413,7 @@ type AcceptedPrompt = {
   messageId: string;
   timestamp: string;
   parentMessageId?: string;
+  promptImageSource?: PromptImageSource;
   senderName?: string;
 };
 
@@ -368,8 +421,9 @@ type AcceptedCommand = AcceptedPrompt & {
   command: SlashCommand;
 };
 
-type AcceptedPromptInput = Omit<AcceptedPrompt, "parentMessageId" | "senderName"> & {
+type AcceptedPromptInput = Omit<AcceptedPrompt, "parentMessageId" | "promptImageSource" | "senderName"> & {
   parentMessageId?: string | undefined;
+  promptImageSource?: PromptImageSource | undefined;
   senderName?: string | undefined;
 };
 
@@ -455,12 +509,98 @@ function formatPersonalityList(personalities: readonly Personality[], currentPer
   return ["Personalities:", ...personalityLines, "", "Use /personality <number> to switch."].join("\n");
 }
 
+async function downloadPromptImage(
+  sock: WASocket,
+  logger: AppLogger,
+  baileysLogger: BaileysLogger,
+  acceptedPrompt: AcceptedPrompt,
+): Promise<ImageDownloadResult> {
+  const { promptImageSource, chatId, messageId } = acceptedPrompt;
+  if (!promptImageSource) {
+    return { status: "none" };
+  }
+  const { imageAttachment } = promptImageSource;
+
+  if (isImageByteSizeTooLarge(imageAttachment.fileLength)) {
+    logger.warn("Skipping image because declared size is too large", {
+      chatId,
+      messageId,
+      imageAttachment: summarizeImageAttachment(imageAttachment),
+      imageSource: promptImageSource.source,
+      maxImageBytes: MAX_IMAGE_BYTES,
+    });
+    return { status: "failed", reply: IMAGE_TOO_LARGE_REPLY };
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = await downloadMediaMessage(
+      promptImageSource.message,
+      "buffer",
+      {},
+      {
+        logger: baileysLogger,
+        reuploadRequest: sock.updateMediaMessage,
+      },
+    );
+  } catch (error) {
+    logger.warn("Failed to download image", {
+      chatId,
+      messageId,
+      imageAttachment: summarizeImageAttachment(imageAttachment),
+      imageSource: promptImageSource.source,
+      error: summarizeError(error),
+    });
+    return { status: "failed", reply: IMAGE_DOWNLOAD_FAILURE_REPLY };
+  }
+
+  let preparedImage: PreparedImageForVision;
+  try {
+    preparedImage = await prepareImageForVision(bytes);
+  } catch (error) {
+    logger.warn("Failed to prepare image for vision", {
+      chatId,
+      messageId,
+      imageAttachment: summarizeImageAttachment(imageAttachment),
+      downloadedByteSize: bytes.byteLength,
+      imageSource: promptImageSource.source,
+      maxImageLongEdge: MAX_IMAGE_LONG_EDGE,
+      error: summarizeError(error),
+    });
+    return { status: "failed", reply: IMAGE_PREP_FAILURE_REPLY };
+  }
+
+  if (isImageByteSizeTooLarge(preparedImage.outputByteSize)) {
+    logger.warn("Skipping image because prepared size is too large", {
+      chatId,
+      messageId,
+      imageAttachment: summarizeImageAttachment(imageAttachment),
+      imageSource: promptImageSource.source,
+      preparedImage: summarizePreparedImage(preparedImage),
+      maxImageBytes: MAX_IMAGE_BYTES,
+    });
+    return { status: "failed", reply: IMAGE_TOO_LARGE_REPLY };
+  }
+
+  logger.info("Downloaded image for prompt", {
+    chatId,
+    messageId,
+    imageAttachment: summarizeImageAttachment(imageAttachment),
+    imageSource: promptImageSource.source,
+    maxImageLongEdge: MAX_IMAGE_LONG_EDGE,
+    preparedImage: summarizePreparedImage(preparedImage),
+  });
+
+  return { status: "ok", bytes: preparedImage.bytes, actualByteSize: preparedImage.outputByteSize };
+}
+
 async function generateSendAndRememberReply(
   sock: WASocket,
   msg: WAMessage,
   chatHistoryService: ChatHistoryService,
   ollamaService: OllamaService,
   logger: AppLogger,
+  baileysLogger: BaileysLogger,
   acceptedPrompt: AcceptedPrompt,
 ): Promise<void> {
   const { chatId, sender, isGroup, triggerType, prompt, messageId, senderName } = acceptedPrompt;
@@ -475,19 +615,45 @@ async function generateSendAndRememberReply(
     return;
   }
 
+  const imageDownload = await downloadPromptImage(sock, logger, baileysLogger, acceptedPrompt);
+  if (imageDownload.status === "failed") {
+    await sock.sendMessage(chatId, { text: imageDownload.reply }, { quoted: msg });
+    return;
+  }
+
   const generateOptions: GenerateReplyOptions = { threadId: threadTarget.threadId };
   if (senderName) {
     generateOptions.senderName = senderName;
   }
+  if (imageDownload.status === "ok") {
+    generateOptions.images = [imageDownload.bytes];
+  }
 
   const startTime = Date.now();
-  const reply = await ollamaService.generateReply(chatId, prompt, generateOptions);
+  let reply: string;
+  try {
+    reply = await ollamaService.generateReply(chatId, prompt, generateOptions);
+  } catch (error) {
+    if (!acceptedPrompt.promptImageSource) {
+      throw error;
+    }
+
+    logger.error("Failed to generate image reply", {
+      chatId,
+      messageId,
+      threadId: threadTarget.threadId,
+      error: summarizeError(error),
+    });
+    await sock.sendMessage(chatId, { text: IMAGE_MODEL_FAILURE_REPLY }, { quoted: msg });
+    return;
+  }
   const elapsedMs = Date.now() - startTime;
   logger.debug("Received Ollama reply", {
     chatId,
     messageId,
     threadId: threadTarget.threadId,
     elapsedMs,
+    imageSource: acceptedPrompt.promptImageSource?.source,
     replyLength: reply.length,
     reply,
   });
@@ -498,6 +664,9 @@ async function generateSendAndRememberReply(
       messageId,
       threadId: threadTarget.threadId,
     });
+    if (acceptedPrompt.promptImageSource) {
+      await sock.sendMessage(chatId, { text: IMAGE_EMPTY_REPLY }, { quoted: msg });
+    }
     return;
   }
 
@@ -510,6 +679,7 @@ async function generateSendAndRememberReply(
     triggerType,
     threadId: threadTarget.threadId,
     elapsedMs,
+    imageSource: acceptedPrompt.promptImageSource?.source,
     quotedMessageId: messageId,
     sentMessageId,
     promptLength: prompt.length,
@@ -648,6 +818,10 @@ function createAcceptedPrompt(input: AcceptedPromptInput): AcceptedPrompt {
     acceptedPrompt.senderName = input.senderName;
   }
 
+  if (input.promptImageSource) {
+    acceptedPrompt.promptImageSource = input.promptImageSource;
+  }
+
   return acceptedPrompt;
 }
 
@@ -730,6 +904,58 @@ function getMessageTimestampIso(msg: WAMessage): string {
 function normalizeText(text: string | null | undefined): string | undefined {
   const trimmedText = text?.trim();
   return trimmedText || undefined;
+}
+
+function summarizeImageAttachment(imageAttachment: ImageAttachmentInfo): Record<string, unknown> {
+  return {
+    contentType: imageAttachment.contentType,
+    fileLength: imageAttachment.fileLength ?? "unknown",
+    height: imageAttachment.height ?? "unknown",
+    mimeType: imageAttachment.mimeType ?? "unknown",
+    width: imageAttachment.width ?? "unknown",
+  };
+}
+
+function summarizePreparedImage(preparedImage: PreparedImageForVision): Record<string, unknown> {
+  return {
+    inputByteSize: preparedImage.inputByteSize,
+    inputHeight: preparedImage.inputHeight ?? "unknown",
+    inputWidth: preparedImage.inputWidth ?? "unknown",
+    outputByteSize: preparedImage.outputByteSize,
+    outputHeight: preparedImage.outputHeight ?? "unknown",
+    outputWidth: preparedImage.outputWidth ?? "unknown",
+    resized: preparedImage.resized,
+  };
+}
+
+function summarizeError(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) {
+    return { message: String(error) };
+  }
+
+  const errorWithFields = error as Error & {
+    code?: unknown;
+    output?: { statusCode?: unknown };
+    status?: unknown;
+  };
+  const summary: Record<string, unknown> = {
+    message: error.message,
+    name: error.name,
+  };
+
+  if (errorWithFields.code !== undefined) {
+    summary.code = errorWithFields.code;
+  }
+
+  if (errorWithFields.status !== undefined) {
+    summary.status = errorWithFields.status;
+  }
+
+  if (errorWithFields.output?.statusCode !== undefined) {
+    summary.statusCode = errorWithFields.output.statusCode;
+  }
+
+  return summary;
 }
 
 function summarizeMessage(msg: WAMessage): Record<string, unknown> {
